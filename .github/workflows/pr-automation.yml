@@ -1,0 +1,297 @@
+name: PR Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          echo "ESLINT_OUTPUT=$(npm run lint 2>&1)" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run Prettier
+        id: prettier
+        run: |
+          echo "PRETTIER_OUTPUT=$(npx prettier --check . --ignore-path .gitignore 2>&1)" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { ESLINT_OUTPUT, PRETTIER_OUTPUT } = process.env;
+            const prNumber = context.issue.number;
+            const status = (ESLINT_OUTPUT.includes('✖') || PRETTIER_OUTPUT.includes('✖')) ? '❌ FAILED' : '✅ PASSED';
+            
+            let commentBody = `## Code Quality Report\n\n**Status:** ${status}\n\n### ESLint Results:\n\`\`\`\n${ESLINT_OUTPUT}\n\`\`\`\n\n### Prettier Results:\n\`\`\`\n${PRETTIER_OUTPUT}\n\`\`\``;
+            
+            // Check if comment already exists
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.body.includes('## Code Quality Report') && comment.user.login === 'github-actions[bot]'
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
+        env:
+          ESLINT_OUTPUT: ${{ steps.eslint.outputs.ESLINT_OUTPUT }}
+          PRETTIER_OUTPUT: ${{ steps.prettier.outputs.PRETTIER_OUTPUT }}
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: test
+        run: |
+          echo "TEST_OUTPUT=$(npm test -- --coverage 2>&1)" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { TEST_OUTPUT } = process.env;
+            const prNumber = context.issue.number;
+            const status = TEST_OUTPUT.includes('failed') ? '❌ FAILED' : '✅ PASSED';
+            
+            // Extract coverage summary
+            const coverageSummary = TEST_OUTPUT.split('Coverage Summary:')[1] || 'No coverage summary found';
+            
+            let commentBody = `## Test Coverage Report\n\n**Status:** ${status}\n\n### Test Output:\n\`\`\`\n${TEST_OUTPUT}\n\`\`\`\n\n### Coverage Summary:\n\`\`\`\n${coverageSummary}\n\`\`\``;
+            
+            // Check if comment already exists
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.body.includes('## Test Coverage Report') && comment.user.login === 'github-actions[bot]'
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
+        env:
+          TEST_OUTPUT: ${{ steps.test.outputs.TEST_OUTPUT }}
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: npm-audit
+        run: |
+          echo "NPM_AUDIT_OUTPUT=$(npm audit --audit-level moderate 2>&1)" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Scan for secrets
+        id: trufflehog
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: ./
+          base: main
+          head: ${{ github.head_ref }}
+          extra_args: --no-verification
+        continue-on-error: true
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { NPM_AUDIT_OUTPUT, TRUFFLEHOG_OUTPUT } = process.env;
+            const prNumber = context.issue.number;
+            const status = (NPM_AUDIT_OUTPUT.includes('high') || NPM_AUDIT_OUTPUT.includes('critical') || TRUFFLEHOG_OUTPUT.includes('Found')) ? '⚠️ WARNING' : '✅ PASSED';
+            
+            let commentBody = `## Security Scan Report\n\n**Status:** ${status}\n\n### Dependencies Vulnerabilities (npm audit):\n\`\`\`\n${NPM_AUDIT_OUTPUT}\n\`\`\`\n\n### Secrets Scan (TruffleHog):\n\`\`\`\n${TRUFFLEHOG_OUTPUT || 'No secrets found'}\n\`\`\``;
+            
+            // Check if comment already exists
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.body.includes('## Security Scan Report') && comment.user.login === 'github-actions[bot]'
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
+        env:
+          NPM_AUDIT_OUTPUT: ${{ steps.npm-audit.outputs.NPM_AUDIT_OUTPUT }}
+          TRUFFLEHOG_OUTPUT: ${{ steps.trufflehog.outputs.TRUFFLEHOG_OUTPUT }}
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          echo "BUILD_OUTPUT=$(npm run build 2>&1)" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Validate endpoints (example)
+        id: validate-endpoints
+        run: |
+          # Example: Check if build directory exists
+          if [ -d "dist" ]; then
+            echo "ENDPOINT_VALIDATION=✅ Build directory 'dist' exists"
+          else
+            echo "ENDPOINT_VALIDATION=❌ Build directory 'dist' not found"
+          fi >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Upload deployment preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: dist/
+          retention-days: 7
+
+      - name: Post Build Validation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { BUILD_OUTPUT, ENDPOINT_VALIDATION } = process.env;
+            const prNumber = context.issue.number;
+            const status = BUILD_OUTPUT.includes('error') ? '❌ FAILED' : '✅ PASSED';
+            
+            let commentBody = `## Build Validation\n\n**Status:** ${status}\n\n### Build Output:\n\`\`\`\n${BUILD_OUTPUT}\n\`\`\`\n\n### Endpoint Validation:\n${ENDPOINT_VALIDATION}\n`;
+            
+            // Check if comment already exists
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber
+            });
+            
+            const existingComment = comments.data.find(comment => 
+              comment.body.includes('## Build Validation') && comment.user.login === 'github-actions[bot]'
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id,
+                body: commentBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: commentBody
+              });
+            }
+        env:
+          BUILD_OUTPUT: ${{ steps.build.outputs.BUILD_OUTPUT }}
+          ENDPOINT_VALIDATION: ${{ steps.validate-endpoints.outputs.ENDPOINT_VALIDATION }}
